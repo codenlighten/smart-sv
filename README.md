@@ -1,5 +1,7 @@
 # SmartSV
 
+[![CI](https://github.com/codenlighten/smart-sv/actions/workflows/ci.yml/badge.svg)](https://github.com/codenlighten/smart-sv/actions/workflows/ci.yml)
+
 A **standalone UTXO blockchain** — its own genesis, network, and consensus,
 built for big blocks, unrestricted Bitcoin Script, and cheap on-chain data.
 
