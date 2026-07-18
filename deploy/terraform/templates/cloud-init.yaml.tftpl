@@ -1,0 +1,81 @@
+#cloud-config
+# Provisions a SmartSV ${role} node: installs Docker, fetches the source,
+# writes role-specific config, and starts the node + Caddy via a systemd unit.
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - ca-certificates
+  - curl
+  - git
+  - ufw
+
+write_files:
+  # Node configuration (SMARTSV_* env), consumed by the container.
+  - path: /opt/smartsv/deploy/node.env
+    permissions: "0640"
+    content: |
+      SMARTSV_API_KEY=${api_key}
+      SMARTSV_LOG_JSON=true
+      SMARTSV_RPC_HOST=0.0.0.0
+      SMARTSV_RPC_PORT=8432
+      SMARTSV_P2P_PORT=8433
+      SMARTSV_MAX_PEERS=32
+%{ if role == "seed" ~}
+      SMARTSV_MINE_ADDRESS=${mine_address}
+      SMARTSV_MINE_INTERVAL=${mine_interval}
+%{ endif ~}
+%{ if connect != "" ~}
+      SMARTSV_CONNECT=${connect}
+%{ endif ~}
+
+  # Compose project .env — only DOMAIN (drives Caddy TLS).
+  - path: /opt/smartsv/deploy/.env
+    permissions: "0644"
+    content: |
+      DOMAIN=${domain}
+
+  - path: /etc/systemd/system/smartsv.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=SmartSV ${role} node
+      After=docker.service network-online.target
+      Requires=docker.service
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      WorkingDirectory=/opt/smartsv/deploy
+      ExecStart=/usr/bin/docker compose -f docker-compose.node.yml up -d --build
+      ExecStop=/usr/bin/docker compose -f docker-compose.node.yml down
+      TimeoutStartSec=0
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  # --- Docker Engine + compose plugin (official convenience script) ---
+  - curl -fsSL https://get.docker.com | sh
+  - systemctl enable --now docker
+
+  # --- Firewall: SSH, HTTP/HTTPS (Caddy), P2P ---
+  - ufw allow 22/tcp
+  - ufw allow 80/tcp
+  - ufw allow 443/tcp
+  - ufw allow 8433/tcp
+  - ufw --force enable
+
+  # --- Fetch source. node.env/.env were written above and are not in the repo,
+  #     so this overlay adds the code without clobbering the generated config. ---
+  - git clone --depth 1 --branch ${git_ref} ${git_repo} /tmp/smartsv-src
+  - cp -a /tmp/smartsv-src/. /opt/smartsv/
+  - rm -rf /tmp/smartsv-src
+
+  # --- Start it ---
+  - systemctl daemon-reload
+  - systemctl enable --now smartsv.service
+
+final_message: "SmartSV ${role} node provisioned in $UPTIME seconds"

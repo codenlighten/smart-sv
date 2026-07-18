@@ -1,0 +1,35 @@
+{
+  "name": "smart-sv",
+  "version": "1.0.0",
+  "description": "SmartSV — a standalone UTXO blockchain: full proof-of-work, Bitcoin Script execution, BIP143 signatures, P2P networking, reorg handling, durable SQLite chainstate, and first-class OP_RETURN data.",
+  "main": "index.js",
+  "bin": {
+    "smartsvd": "bin/smartsvd.js",
+    "smartsv": "bin/smartsv.js"
+  },
+  "scripts": {
+    "start": "node bin/smartsvd.js",
+    "test": "node test/e2e.test.js && node test/persist.test.js && node test/reorg.test.js && node test/p2p.test.js && node test/p2p-reorg.test.js",
+    "test:e2e": "node test/e2e.test.js",
+    "test:persist": "node test/persist.test.js",
+    "test:reorg": "node test/reorg.test.js",
+    "test:p2p": "node test/p2p.test.js && node test/p2p-reorg.test.js"
+  },
+  "keywords": [
+    "blockchain",
+    "smartsv",
+    "smartledger",
+    "utxo",
+    "proof-of-work",
+    "bitcoin-script",
+    "p2p",
+    "op_return"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@smartledger/bsv": "^7.1.0",
+    "better-sqlite3": "^12.11.1",
+    "ws": "^8.21.1"
+  }
+}

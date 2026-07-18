@@ -1,0 +1,12 @@
+node_modules
+data
+*.db
+*.db-wal
+*.db-shm
+.git
+.gitignore
+deploy/terraform/.terraform
+deploy/terraform/*.tfstate*
+**/*.log
+scratchpad
+test

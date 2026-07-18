@@ -1,0 +1,30 @@
+# Caddy reverse proxy for a SmartSV node's RPC/WS API.
+#
+# {$DOMAIN} controls TLS:
+#   - a real FQDN (e.g. rpc.example.com) → automatic Let's Encrypt HTTPS
+#   - ":80"  → plain HTTP (local docker-compose / no domain yet)
+# {$UPSTREAM} is the node's RPC address, e.g. seed:8432 or 127.0.0.1:8432.
+
+{$DOMAIN} {
+	encode gzip
+
+	# Health checks and metrics stay unauthenticated (Caddy just proxies them);
+	# the node itself enforces the API key on mutating POST routes.
+	reverse_proxy {$UPSTREAM} {
+		# Preserve WebSocket upgrades for the live block/tx feed.
+		header_up Host {host}
+		header_up X-Real-IP {remote_host}
+	}
+
+	# Basic hardening headers.
+	header {
+		-Server
+		Referrer-Policy "no-referrer"
+		X-Content-Type-Options "nosniff"
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

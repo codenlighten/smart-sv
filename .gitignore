@@ -1,0 +1,23 @@
+node_modules/
+data/
+*.dat
+*.db
+*.db-wal
+*.db-shm
+.smartsv/
+npm-debug.log*
+.DS_Store
+
+# Secrets & local env
+.env
+
+# Terraform
+deploy/terraform/.terraform/
+deploy/terraform/.terraform.lock.hcl
+deploy/terraform/*.tfstate
+deploy/terraform/*.tfstate.*
+deploy/terraform/terraform.tfvars
+deploy/terraform/*.tfplan
+
+# Packaged tarballs
+*.tgz

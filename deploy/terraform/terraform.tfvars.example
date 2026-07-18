@@ -1,0 +1,30 @@
+# Copy to terraform.tfvars and fill in. NEVER commit the filled-in file.
+
+# DigitalOcean API token (Control Panel → API → Generate New Token).
+# Or export TF_VAR_do_token / DIGITALOCEAN_TOKEN instead of putting it here.
+do_token = "dop_v1_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# SSH key fingerprints already uploaded to your DO account (Settings → Security).
+# Get them with: doctl compute ssh-key list
+ssh_key_fingerprints = ["aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99"]
+
+# Bearer key for mutating RPC routes. Generate: openssl rand -hex 32
+api_key = "REPLACE_WITH_openssl_rand_hex_32"
+
+# Address the seed mines to. Create with: node bin/smartsv.js newkey
+mine_address = "1YourSmartSVAddressHere000000000000"
+
+# This repository's git URL (droplets clone + build it).
+git_repo = "https://github.com/youruser/smart-sv.git"
+git_ref  = "main"
+
+# Optional public domain for TLS. Leave "" to serve plain HTTP on the reserved IP.
+# domain = "rpc.example.com"
+
+# Fleet shape.
+region       = "nyc3"
+droplet_size = "s-1vcpu-2gb"
+peer_count   = 2
+
+# Lock SSH to your IP in production, e.g. "203.0.113.7/32".
+admin_ssh_cidr = "0.0.0.0/0"

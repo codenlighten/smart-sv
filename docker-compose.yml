@@ -1,0 +1,88 @@
+# Local mirror of the production topology: a mining seed node, two peers that
+# sync & gossip with it, and a Caddy reverse proxy terminating TLS in front of
+# the seed's RPC/WS API. Bring it up with `make up` (or `docker compose up`).
+#
+# Copy .env.example to .env and set SMARTSV_API_KEY (and DOMAIN for real TLS).
+#
+# `version` is kept for docker-compose v1 compatibility; the modern `docker
+# compose` plugin ignores it. Set the project name with `-p smartsv`.
+
+version: "3.8"
+
+x-node-common: &node-common
+  build: .
+  restart: unless-stopped
+  environment:
+    SMARTSV_API_KEY: ${SMARTSV_API_KEY:?set SMARTSV_API_KEY in .env}
+    SMARTSV_LOG_JSON: "true"
+    SMARTSV_RPC_HOST: 0.0.0.0
+
+services:
+  seed:
+    <<: *node-common
+    container_name: smartsv-seed
+    command: ["--mine", "${MINE_ADDRESS:-}", "--interval", "5"]
+    environment:
+      SMARTSV_API_KEY: ${SMARTSV_API_KEY:?}
+      SMARTSV_LOG_JSON: "true"
+      SMARTSV_RPC_HOST: 0.0.0.0
+      SMARTSV_MINE_ADDRESS: ${MINE_ADDRESS:-}
+      SMARTSV_MINE_INTERVAL: "5"
+    volumes:
+      - seed-data:/data
+    ports:
+      - "8433:8433" # P2P open to the world
+    networks: [smartsv]
+
+  peer1:
+    <<: *node-common
+    container_name: smartsv-peer1
+    environment:
+      SMARTSV_API_KEY: ${SMARTSV_API_KEY:?}
+      SMARTSV_LOG_JSON: "true"
+      SMARTSV_RPC_HOST: 0.0.0.0
+      SMARTSV_CONNECT: "seed:8433"
+    volumes:
+      - peer1-data:/data
+    depends_on: [seed]
+    networks: [smartsv]
+
+  peer2:
+    <<: *node-common
+    container_name: smartsv-peer2
+    environment:
+      SMARTSV_API_KEY: ${SMARTSV_API_KEY:?}
+      SMARTSV_LOG_JSON: "true"
+      SMARTSV_RPC_HOST: 0.0.0.0
+      SMARTSV_CONNECT: "seed:8433"
+    volumes:
+      - peer2-data:/data
+    depends_on: [seed]
+    networks: [smartsv]
+
+  caddy:
+    image: caddy:2
+    container_name: smartsv-caddy
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:-:80} # set to your FQDN for automatic Let's Encrypt TLS
+      UPSTREAM: seed:8432
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on: [seed]
+    networks: [smartsv]
+
+networks:
+  smartsv:
+
+volumes:
+  seed-data:
+  peer1-data:
+  peer2-data:
+  caddy-data:
+  caddy-config:
