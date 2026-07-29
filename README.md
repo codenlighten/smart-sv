@@ -38,6 +38,7 @@ run end-to-end.
 | **Fork choice & reorg** | Heaviest-chainwork fork choice. When a side chain outweighs the active tip the chain **reorganises**: active blocks are disconnected (UTXO changes reversed via stored undo data) and the side chain is connected forward with full re-validation. An invalid heavier chain is **rolled back** and the valid chain restored. The mempool returns transactions orphaned by a reorg. |
 | **P2P network** | Real Bitcoin-style TCP wire protocol: `networkMagic`-framed, sha256d-checksummed messages; version/verack handshake with self-connection detection; `inv`/`getdata` gossip relay of new blocks and txs; `getaddr`/`addr` peer discovery; ping/pong keep-alive (`src/p2p/`). |
 | **Headers-first sync** | Initial block download runs `getheaders → headers → getdata → block`: the most-work chain is established from 80-byte headers, each PoW-checked and linked to a block we already hold, *before* a single body is fetched. Bodies then download in a capped in-flight window along that path, and the header index is pruned as they connect. A peer cannot make the node buffer bodies for a chain it hasn't done the work for (`src/p2p/headerchain.js`). |
+| **Compact block relay** | New tips are announced as a sketch — header, nonce, one 6-byte short id per transaction, coinbase prefilled — so a peer that has been relaying transactions rebuilds the block from its own mempool and asks only for what it is missing (`getblocktxn`/`blocktxn`). Short ids are salted per announcement, and a rebuilt block is only accepted if its merkle root matches the header; anything else falls back to a full fetch (`src/p2p/compact.js`). |
 | **Address book** | Every address learned from `version`/`addr` gossip is persisted to SQLite with its dial history. A background dialer keeps `targetOutbound` connections open, preferring peers that have connected before, backing off exponentially from failures, banning misbehaving addresses, and shunning the node's own. A restarted node reconnects from the book without any configured seed (`src/p2p/addrbook.js`). |
 | **Node + API** | A `Node` class wiring it together, plus a REST + WebSocket server (`src/node.js`, `src/api/server.js`). The P2P layer drives the node purely through the same `submitTransaction` / `submitBlock` entry points. |
 | **Daemon + CLI** | `smartsvd` full-node daemon and `smartsv` CLI wallet/client. Env-driven config, structured logging, graceful shutdown. |
@@ -216,7 +217,6 @@ deploy/
 
 ## Roadmap
 
-- Compact block relay (headers-first sync is done; bodies still transfer whole)
 - Pruning of deeply-buried side chains from the block tree
 - DigitalOcean Container Registry image (skip per-droplet builds)
 

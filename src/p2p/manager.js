@@ -7,6 +7,8 @@ const params = require('../params');
 const { Peer } = require('./peer');
 const { AddrBook } = require('./addrbook');
 const { HeaderChain } = require('./headerchain');
+const compact = require('./compact');
+const pow = require('../pow');
 
 const PROTOCOL_VERSION = 1;
 const MAX_INV_PER_BATCH = 500; // block hashes announced per getblocks response
@@ -14,6 +16,7 @@ const MAX_HEADERS_PER_BATCH = 2000; // headers served per getheaders
 const MAX_BLOCKS_IN_FLIGHT = 16; // body requests outstanding during sync
 const BODY_TIMEOUT_MS = 30000; // re-request a body that never arrived
 const MAX_UNCONNECTING_HEADERS = 3; // strikes before dropping a peer sending dangling chains
+const COMPACT_TIMEOUT_MS = 30000; // give up on a half-reconstructed compact block
 const PING_INTERVAL_MS = 30000;
 const SYNC_INTERVAL_MS = 5000; // re-drive a download that stalled
 const DIAL_INTERVAL_MS = 15000; // how often to top up outbound connections
@@ -30,7 +33,8 @@ const MAX_ADDRS_PER_MSG = 1000;
  *     block, so the most-work chain is established from 80-byte PoW-checked
  *     headers before any body is fetched (see headerchain.js)
  *   - inv/getdata gossip relay of new blocks and transactions, wired to the
- *     node's `block`/`tx` events
+ *     node's `block`/`tx` events, with compact-block announcement of new tips
+ *     to peers that support it (see compact.js)
  *   - a persistent address book (see addrbook.js) fed by getaddr/addr exchange,
  *     and automatic outbound peer management on top of it
  *
@@ -51,6 +55,9 @@ class PeerManager extends EventEmitter {
     this.dialing = new Set(); // addrKeys with a dial in flight
     this.headers = new HeaderChain(node.chain); // headers-first download plan
     this.inFlight = new Map(); // block hash -> { peer, at } body requests outstanding
+    this.pendingCompact = new Map(); // block hash -> partially reconstructed compact block
+    this.compactEnabled = opts.compact !== false;
+    this.stats = { compactBlocks: 0, compactTxsSaved: 0, compactFallbacks: 0 };
     this.server = null;
     this.nonce = sv.crypto.Random.getRandomBuffer(8).toString('hex');
     this._pingTimer = null;
@@ -81,7 +88,7 @@ class PeerManager extends EventEmitter {
     });
 
     // Relay locally-accepted blocks/txs to peers.
-    this.node.on('block', ({ block }) => this._announce('block', block.id));
+    this.node.on('block', ({ block }) => this._announceBlock(block));
     this.node.on('tx', ({ txid }) => this._announce('tx', txid));
 
     this._pingTimer = setInterval(() => this._pingAll(), PING_INTERVAL_MS);
@@ -223,6 +230,7 @@ class PeerManager extends EventEmitter {
       nonce: this.nonce,
       userAgent: `/${params.chainName}:1.0/`,
       port: this.actualPort || this.port,
+      compact: this.compactEnabled, // we can receive cmpctblock announcements
     });
   }
 
@@ -252,6 +260,12 @@ class PeerManager extends EventEmitter {
         return this._onGetHeaders(peer, payload);
       case 'headers':
         return this._onHeaders(peer, payload);
+      case 'cmpctblock':
+        return this._onCompactBlock(peer, payload);
+      case 'getblocktxn':
+        return this._onGetBlockTxn(peer, payload);
+      case 'blocktxn':
+        return this._onBlockTxn(peer, payload);
       case 'block':
         return this._onBlock(peer, payload);
       case 'tx':
@@ -274,6 +288,9 @@ class PeerManager extends EventEmitter {
     peer.height = payload.height || 0;
     peer.userAgent = payload.userAgent;
     peer.remoteNonce = payload.nonce;
+    // Only send sketches to peers that said they understand them; older nodes
+    // keep getting plain inv announcements.
+    peer.wantsCompact = this.compactEnabled && !!payload.compact;
     if (payload.port && peer.socket.remoteAddress) {
       // The peer's *listening* address (their source port is ephemeral).
       peer.advertisedAddr = `${cleanHost(peer.socket.remoteAddress)}:${payload.port}`;
@@ -332,6 +349,25 @@ class PeerManager extends EventEmitter {
     }
   }
 
+  /**
+   * Announce a new tip. Peers that support compact relay get the sketch
+   * directly — one round trip instead of inv/getdata, and without re-sending
+   * transactions they already hold in their mempool.
+   */
+  _announceBlock(block) {
+    for (const peer of this.peers) {
+      if (!peer.handshakeDone) continue;
+      if (peer.known.has(block.id)) continue;
+      peer.markKnown(block.id);
+      if (peer.wantsCompact) {
+        const nonce = sv.crypto.Random.getRandomBuffer(8).toString('hex');
+        peer.send('cmpctblock', compact.buildCompact(block, nonce));
+      } else {
+        peer.send('inv', { items: [{ type: 'block', hash: block.id }] });
+      }
+    }
+  }
+
   _onInv(peer, payload) {
     const want = [];
     for (const item of payload.items || []) {
@@ -361,6 +397,134 @@ class PeerManager extends EventEmitter {
         }
       }
     }
+  }
+
+  // --- compact block relay --------------------------------------------------
+
+  /**
+   * A peer sketched its new tip. Fill in what our mempool already holds and ask
+   * only for the rest; if everything is present the block is complete without a
+   * single transaction crossing the wire.
+   */
+  _onCompactBlock(peer, payload) {
+    // Check the header before touching the mempool: matching short ids costs a
+    // hash per mempool entry, so it must not be reachable for free.
+    let header;
+    try {
+      header = sv.BlockHeader.fromBuffer(Buffer.from(payload.header || '', 'hex'));
+    } catch (e) {
+      this._penalize(peer, `undecodable compact block header: ${e.message}`);
+      return;
+    }
+    const hash = header.hash;
+    peer.markKnown(hash);
+    if (this.node.chain.byHash.has(hash) || this.pendingCompact.has(hash)) return;
+    if (!pow.checkProofOfWork(header)) {
+      this._penalize(peer, `compact block ${hash.slice(0, 12)} fails proof of work`);
+      return;
+    }
+
+    let slots;
+    let missing;
+    try {
+      ({ slots, missing } = compact.reconstruct(payload, this._mempoolTxs()));
+    } catch (e) {
+      this._penalize(peer, `malformed compact block: ${e.message}`);
+      return;
+    }
+
+    this.stats.compactBlocks++;
+    this.stats.compactTxsSaved += slots.length - missing.length - 1; // minus the prefilled coinbase
+
+    if (!missing.length) {
+      this._log(
+        `[p2p] compact block ${hash.slice(0, 12)} rebuilt from mempool ` +
+          `(${slots.length} txs, 0 requested)`
+      );
+      this._acceptReconstructed(peer, header, slots);
+      return;
+    }
+
+    this.pendingCompact.set(hash, { peer, header, slots, missing, at: Date.now() });
+    this._log(
+      `[p2p] compact block ${hash.slice(0, 12)}: ${missing.length}/${slots.length} txs missing`
+    );
+    peer.send('getblocktxn', { blockHash: hash, indexes: missing });
+  }
+
+  /** Serve the transactions a peer couldn't find for one of our blocks. */
+  _onGetBlockTxn(peer, payload) {
+    const block = this.node.chain.getBlock(payload.blockHash);
+    if (!block) return;
+    const txs = [];
+    for (const index of payload.indexes || []) {
+      const tx = block.transactions[index];
+      if (!tx) return; // bogus index: say nothing rather than guess
+      txs.push(tx.toBuffer().toString('hex'));
+    }
+    peer.send('blocktxn', { blockHash: payload.blockHash, txs });
+  }
+
+  _onBlockTxn(peer, payload) {
+    const pending = this.pendingCompact.get(payload.blockHash);
+    if (!pending) return;
+    this.pendingCompact.delete(payload.blockHash);
+
+    const txs = payload.txs || [];
+    if (txs.length !== pending.missing.length) {
+      this._fallbackToFullBlock(peer, payload.blockHash, 'wrong number of transactions');
+      return;
+    }
+    try {
+      pending.missing.forEach((index, i) => {
+        pending.slots[index] = new sv.Transaction(Buffer.from(txs[i], 'hex'));
+      });
+    } catch (e) {
+      this._fallbackToFullBlock(peer, payload.blockHash, `undecodable transaction: ${e.message}`);
+      return;
+    }
+    this._acceptReconstructed(peer, pending.header, pending.slots);
+  }
+
+  /**
+   * Hand a rebuilt block to consensus. The merkle check inside `assemble` is
+   * what makes short ids safe: a collision (or a peer feeding us the wrong
+   * transactions) produces a block that doesn't match the header, and we simply
+   * ask for the real thing instead.
+   */
+  _acceptReconstructed(peer, header, slots) {
+    const block = compact.assemble(header, slots);
+    if (!block) {
+      this._fallbackToFullBlock(peer, header.hash, 'merkle root mismatch after reconstruction');
+      return;
+    }
+    this._acceptBlock(peer, block);
+  }
+
+  /** Compact reconstruction failed — request the block the plain way. */
+  _fallbackToFullBlock(peer, hash, reason) {
+    this.stats.compactFallbacks++;
+    this._log(`[p2p] compact block ${hash.slice(0, 12)} failed (${reason}); requesting in full`);
+    this.pendingCompact.delete(hash);
+    peer.send('getdata', { items: [{ type: 'block', hash }] });
+  }
+
+  /** Drop compact reconstructions whose missing transactions never arrived. */
+  _expirePendingCompact() {
+    const cutoff = Date.now() - COMPACT_TIMEOUT_MS;
+    for (const [hash, pending] of this.pendingCompact) {
+      if (pending.at < cutoff) {
+        this.pendingCompact.delete(hash);
+        if (!pending.peer.socket.destroyed) {
+          this._fallbackToFullBlock(pending.peer, hash, 'timed out');
+        }
+      }
+    }
+  }
+
+  /** Mempool transactions, the candidate pool for short-id matching. */
+  _mempoolTxs() {
+    return [...this.node.mempool.txs.values()].map((e) => e.tx);
   }
 
   // --- block sync (headers first) -------------------------------------------
@@ -468,6 +632,7 @@ class PeerManager extends EventEmitter {
   _syncTick() {
     if (!this._running) return;
     this._expireInFlight();
+    this._expirePendingCompact();
     const ready = [...this.peers].filter((p) => p.handshakeDone && !p.socket.destroyed);
     if (!ready.length) return;
 
@@ -553,8 +718,14 @@ class PeerManager extends EventEmitter {
       this._penalize(peer, `undecodable block: ${e.message}`);
       return;
     }
+    this._acceptBlock(peer, block);
+  }
+
+  /** Apply a block that arrived either whole or rebuilt from a compact sketch. */
+  _acceptBlock(peer, block) {
     peer.markKnown(block.id);
     this.inFlight.delete(block.id);
+    this.pendingCompact.delete(block.id);
 
     let res;
     try {
