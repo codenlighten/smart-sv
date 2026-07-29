@@ -10,7 +10,7 @@ npm-debug.log*
 
 # Secrets & local env
 .env
-
+resume.md
 # Terraform
 deploy/terraform/.terraform/
 deploy/terraform/.terraform.lock.hcl
