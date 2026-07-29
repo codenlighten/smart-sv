@@ -6,10 +6,16 @@ const sv = require('../sv');
 const params = require('../params');
 const { Peer } = require('./peer');
 const { AddrBook } = require('./addrbook');
+const { HeaderChain } = require('./headerchain');
 
 const PROTOCOL_VERSION = 1;
 const MAX_INV_PER_BATCH = 500; // block hashes announced per getblocks response
+const MAX_HEADERS_PER_BATCH = 2000; // headers served per getheaders
+const MAX_BLOCKS_IN_FLIGHT = 16; // body requests outstanding during sync
+const BODY_TIMEOUT_MS = 30000; // re-request a body that never arrived
+const MAX_UNCONNECTING_HEADERS = 3; // strikes before dropping a peer sending dangling chains
 const PING_INTERVAL_MS = 30000;
+const SYNC_INTERVAL_MS = 5000; // re-drive a download that stalled
 const DIAL_INTERVAL_MS = 15000; // how often to top up outbound connections
 const FIRST_DIAL_DELAY_MS = 500; // reconnect to known peers promptly after start
 const MAX_ADDRS_PER_MSG = 1000;
@@ -20,7 +26,9 @@ const MAX_ADDRS_PER_MSG = 1000;
  * Responsibilities:
  *   - accept inbound and dial outbound TCP connections
  *   - version/verack handshake (with self-connection detection)
- *   - initial block download: getblocks → inv → getdata → block, applied in order
+ *   - headers-first initial block download: getheaders → headers → getdata →
+ *     block, so the most-work chain is established from 80-byte PoW-checked
+ *     headers before any body is fetched (see headerchain.js)
  *   - inv/getdata gossip relay of new blocks and transactions, wired to the
  *     node's `block`/`tx` events
  *   - a persistent address book (see addrbook.js) fed by getaddr/addr exchange,
@@ -41,6 +49,8 @@ class PeerManager extends EventEmitter {
     );
     this.peers = new Set();
     this.dialing = new Set(); // addrKeys with a dial in flight
+    this.headers = new HeaderChain(node.chain); // headers-first download plan
+    this.inFlight = new Map(); // block hash -> { peer, at } body requests outstanding
     this.server = null;
     this.nonce = sv.crypto.Random.getRandomBuffer(8).toString('hex');
     this._pingTimer = null;
@@ -77,6 +87,9 @@ class PeerManager extends EventEmitter {
     this._pingTimer = setInterval(() => this._pingAll(), PING_INTERVAL_MS);
     if (this._pingTimer.unref) this._pingTimer.unref();
 
+    this._syncTimer = setInterval(() => this._syncTick(), SYNC_INTERVAL_MS);
+    if (this._syncTimer.unref) this._syncTimer.unref();
+
     // Keep outbound connections topped up from the address book. The first pass
     // runs almost immediately so a restarted node reconnects to peers it already
     // knows without waiting a full interval.
@@ -90,6 +103,7 @@ class PeerManager extends EventEmitter {
   stop() {
     this._running = false;
     if (this._pingTimer) clearInterval(this._pingTimer);
+    if (this._syncTimer) clearInterval(this._syncTimer);
     if (this._dialTimer) clearInterval(this._dialTimer);
     if (this._firstDial) clearTimeout(this._firstDial);
     for (const peer of this.peers) peer.destroy();
@@ -184,6 +198,10 @@ class PeerManager extends EventEmitter {
     peer.on('message', (msg) => this._onMessage(peer, msg));
     peer.on('close', () => {
       this.peers.delete(peer);
+      // Release this peer's outstanding body requests so another peer can serve them.
+      for (const [hash, req] of this.inFlight) {
+        if (req.peer === peer) this.inFlight.delete(hash);
+      }
       if (addrKey) {
         this.dialing.delete(addrKey);
         // A dial that never reached verack counts against the address, so its
@@ -230,6 +248,10 @@ class PeerManager extends EventEmitter {
         return this._onGetData(peer, payload);
       case 'getblocks':
         return this._onGetBlocks(peer, payload);
+      case 'getheaders':
+        return this._onGetHeaders(peer, payload);
+      case 'headers':
+        return this._onHeaders(peer, payload);
       case 'block':
         return this._onBlock(peer, payload);
       case 'tx':
@@ -272,7 +294,7 @@ class PeerManager extends EventEmitter {
 
     // Learn about more peers, and start syncing if this peer is ahead.
     peer.send('getaddr', {});
-    if (peer.height > this.node.chain.height()) this._requestBlocks(peer);
+    if (peer.height > this.node.chain.height()) this._requestHeaders(peer);
   }
 
   // --- address book --------------------------------------------------------
@@ -341,10 +363,147 @@ class PeerManager extends EventEmitter {
     }
   }
 
-  // --- block sync ----------------------------------------------------------
+  // --- block sync (headers first) -------------------------------------------
 
-  _requestBlocks(peer) {
-    peer.send('getblocks', { locator: this._buildLocator() });
+  /**
+   * Ask a peer for the headers that follow the best chain we know. The locator
+   * starts from our furthest *header* when a download is already in progress, so
+   * successive batches continue rather than restarting at our block tip.
+   */
+  _requestHeaders(peer) {
+    const best = this.headers.best();
+    const locator =
+      best && best.height > this.node.chain.height()
+        ? this.headers.locatorFrom(best)
+        : this._buildLocator();
+    peer.send('getheaders', { locator });
+  }
+
+  _onGetHeaders(peer, payload) {
+    const from = this._forkHeightFromLocator(payload) + 1;
+    const top = Math.min(this.node.chain.height(), from - 1 + MAX_HEADERS_PER_BATCH);
+    const headers = [];
+    for (let h = from; h <= top; h++) {
+      const entry = this.node.chain.index[h];
+      if (entry) headers.push(entry.block.header.toBuffer().toString('hex'));
+    }
+    peer.send('headers', { headers });
+  }
+
+  _onHeaders(peer, payload) {
+    const batch = (payload.headers || []).slice(0, MAX_HEADERS_PER_BATCH);
+    let added = 0;
+    for (const hex of batch) {
+      let header;
+      try {
+        header = sv.BlockHeader.fromBuffer(Buffer.from(hex, 'hex'));
+      } catch (e) {
+        this._penalize(peer, `undecodable header: ${e.message}`);
+        return;
+      }
+      const res = this.headers.add(header);
+      if (res.status === 'bad-pow') {
+        this._penalize(peer, `header ${header.hash.slice(0, 12)} fails proof of work`);
+        return;
+      }
+      if (res.status === 'orphan') {
+        // The batch does not attach to anything we know. Usually our locator
+        // was just stale, so retry once from our own tip — but a peer that
+        // keeps sending chains that lead nowhere is wasting our time, and
+        // answering it forever would be a request/response loop.
+        peer.unconnectingHeaders = (peer.unconnectingHeaders || 0) + 1;
+        if (peer.unconnectingHeaders > MAX_UNCONNECTING_HEADERS) {
+          this._penalize(peer, 'repeatedly sent headers that connect to nothing');
+          return;
+        }
+        this._log(
+          `[p2p] headers from ${peer.id} do not connect ` +
+            `(${peer.unconnectingHeaders}/${MAX_UNCONNECTING_HEADERS}); retrying from our tip`
+        );
+        peer.send('getheaders', { locator: this._buildLocator() });
+        return;
+      }
+      if (res.status === 'added') added++;
+    }
+
+    peer.unconnectingHeaders = 0; // this batch attached; forgive earlier misses
+    if (added) {
+      const best = this.headers.best();
+      this._log(
+        `[p2p] +${added} headers from ${peer.id}` +
+          (best ? ` (best header height ${best.height})` : '')
+      );
+    }
+    // A full batch means the peer has more; keep pulling headers while the
+    // bodies for what we already have are downloading.
+    if (batch.length >= MAX_HEADERS_PER_BATCH) this._requestHeaders(peer);
+    this._requestBodies(peer);
+  }
+
+  /**
+   * Fetch the next window of block bodies along the best header path. Called
+   * whenever headers arrive and after every block is applied, so the in-flight
+   * window stays full without ever running unbounded.
+   */
+  _requestBodies(peer) {
+    if (!peer || !peer.handshakeDone || peer.socket.destroyed) return;
+    this._expireInFlight();
+    const budget = MAX_BLOCKS_IN_FLIGHT - this.inFlight.size;
+    if (budget <= 0) return;
+
+    const want = this.headers.missingBodies(budget, this.inFlight);
+    if (!want.length) return;
+
+    const at = Date.now();
+    for (const hash of want) this.inFlight.set(hash, { peer, at });
+    peer.send('getdata', { items: want.map((hash) => ({ type: 'block', hash })) });
+  }
+
+  /**
+   * Periodic nudge so a download can't die quietly. Sync is normally driven by
+   * arriving messages, which means a peer that simply stops replying would
+   * leave us stuck; here timed-out requests are released and the window is
+   * refilled — from a different peer if the original one is gone.
+   */
+  _syncTick() {
+    if (!this._running) return;
+    this._expireInFlight();
+    const ready = [...this.peers].filter((p) => p.handshakeDone && !p.socket.destroyed);
+    if (!ready.length) return;
+
+    if (this.headers.best()) {
+      // We know of a better chain and still owe ourselves bodies for it.
+      for (const peer of ready) {
+        this._requestBodies(peer);
+        if (this.inFlight.size >= MAX_BLOCKS_IN_FLIGHT) break;
+      }
+      return;
+    }
+    // Otherwise ask anyone claiming a longer chain for their headers.
+    for (const peer of ready) {
+      if (peer.height > this.node.chain.height()) this._requestHeaders(peer);
+    }
+  }
+
+  /** Drop body requests a peer never answered so another attempt can be made. */
+  _expireInFlight() {
+    const cutoff = Date.now() - BODY_TIMEOUT_MS;
+    for (const [hash, req] of this.inFlight) {
+      if (req.at < cutoff || req.peer.socket.destroyed) this.inFlight.delete(hash);
+    }
+  }
+
+  /** The highest locator hash that is on our active chain (0 = only genesis). */
+  _forkHeightFromLocator(payload) {
+    if (Array.isArray(payload.locator)) {
+      for (const hash of payload.locator) {
+        const node = this.node.chain.byHash.get(hash);
+        if (node && node.main) return node.height;
+      }
+    } else if (payload.height != null) {
+      return payload.height; // back-compat with the height-only form
+    }
+    return 0;
   }
 
   /**
@@ -367,22 +526,13 @@ class PeerManager extends EventEmitter {
     return locator;
   }
 
+  /**
+   * Serve the pre-headers-first sync protocol. Nothing in this build sends
+   * `getblocks` any more, but already-deployed nodes still do, so we keep
+   * answering them.
+   */
   _onGetBlocks(peer, payload) {
-    // Find the fork height: the highest locator hash that is on our active chain.
-    let forkHeight = 0;
-    if (Array.isArray(payload.locator)) {
-      for (const hash of payload.locator) {
-        const node = this.node.chain.byHash.get(hash);
-        if (node && node.main) {
-          forkHeight = node.height;
-          break;
-        }
-      }
-    } else if (payload.height != null) {
-      forkHeight = payload.height; // back-compat with the height-only form
-    }
-
-    const from = forkHeight + 1;
+    const from = this._forkHeightFromLocator(payload) + 1;
     const top = Math.min(this.node.chain.height(), from - 1 + MAX_INV_PER_BATCH);
     const items = [];
     for (let h = from; h <= top; h++) {
@@ -404,11 +554,14 @@ class PeerManager extends EventEmitter {
       return;
     }
     peer.markKnown(block.id);
+    this.inFlight.delete(block.id);
+
     let res;
     try {
       res = this.node.submitBlock(block);
     } catch (e) {
       this._log(`[p2p] rejected block from ${peer.id}: ${e.message}`);
+      this.headers.drop(block.id);
       return;
     }
 
@@ -418,22 +571,25 @@ class PeerManager extends EventEmitter {
           `[p2p] connected block ${res.height} ${block.id.slice(0, 12)}` +
             `${res.reorg ? ' (reorg)' : ''} from ${peer.id}`
         );
-        // Keep pulling if the peer is still ahead.
-        if (peer.height > this.node.chain.height()) this._requestBlocks(peer);
         break;
       case 'orphan':
-        // Missing ancestors — ask this peer to fill the gap.
-        this._requestBlocks(peer);
+        // Missing ancestors — get the headers that lead here first.
+        this._requestHeaders(peer);
         break;
       case 'sidechain':
         this._log(`[p2p] stored side-chain block ${block.id.slice(0, 12)} from ${peer.id}`);
         break;
       case 'invalid':
+        this.headers.drop(block.id);
         this._penalize(peer, `invalid block ${block.id.slice(0, 12)}: ${res.error}`);
-        break;
+        return;
       default:
         break; // duplicate
     }
+
+    // The body landed: retire its header and pull the next slice of the window.
+    this.headers.prune();
+    this._requestBodies(peer);
   }
 
   _onTx(peer, payload) {

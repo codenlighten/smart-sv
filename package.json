@@ -9,12 +9,13 @@
   },
   "scripts": {
     "start": "node bin/smartsvd.js",
-    "test": "node test/e2e.test.js && node test/persist.test.js && node test/reorg.test.js && node test/p2p.test.js && node test/p2p-reorg.test.js && node test/addrbook.test.js",
+    "test": "node test/e2e.test.js && node test/persist.test.js && node test/reorg.test.js && node test/p2p.test.js && node test/p2p-reorg.test.js && node test/addrbook.test.js && node test/headers.test.js",
     "test:e2e": "node test/e2e.test.js",
     "test:persist": "node test/persist.test.js",
     "test:reorg": "node test/reorg.test.js",
     "test:p2p": "node test/p2p.test.js && node test/p2p-reorg.test.js",
-    "test:addrbook": "node test/addrbook.test.js"
+    "test:addrbook": "node test/addrbook.test.js",
+    "test:headers": "node test/headers.test.js"
   },
   "keywords": [
     "blockchain",

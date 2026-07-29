@@ -36,7 +36,8 @@ run end-to-end.
 | **Chain state** | Full **block tree** with per-block cumulative chainwork, side-chain storage, an orphan pool, and median-time-past (`src/blockchain.js`). |
 | **Durable storage** | A transactional **SQLite chainstate** (`src/store/chainstore.js`) is the source of truth for the block tree, UTXO set, undo data and tip. Startup **loads** the working set — no chain replay or re-validation — and every tip change (extension or multi-block reorg) commits atomically, so a crash mid-reorg can't corrupt state. |
 | **Fork choice & reorg** | Heaviest-chainwork fork choice. When a side chain outweighs the active tip the chain **reorganises**: active blocks are disconnected (UTXO changes reversed via stored undo data) and the side chain is connected forward with full re-validation. An invalid heavier chain is **rolled back** and the valid chain restored. The mempool returns transactions orphaned by a reorg. |
-| **P2P network** | Real Bitcoin-style TCP wire protocol: `networkMagic`-framed, sha256d-checksummed messages; version/verack handshake with self-connection detection; `getblocks → inv → getdata → block` initial block download; `inv`/`getdata` gossip relay of new blocks and txs; `getaddr`/`addr` peer discovery; ping/pong keep-alive (`src/p2p/`). |
+| **P2P network** | Real Bitcoin-style TCP wire protocol: `networkMagic`-framed, sha256d-checksummed messages; version/verack handshake with self-connection detection; `inv`/`getdata` gossip relay of new blocks and txs; `getaddr`/`addr` peer discovery; ping/pong keep-alive (`src/p2p/`). |
+| **Headers-first sync** | Initial block download runs `getheaders → headers → getdata → block`: the most-work chain is established from 80-byte headers, each PoW-checked and linked to a block we already hold, *before* a single body is fetched. Bodies then download in a capped in-flight window along that path, and the header index is pruned as they connect. A peer cannot make the node buffer bodies for a chain it hasn't done the work for (`src/p2p/headerchain.js`). |
 | **Address book** | Every address learned from `version`/`addr` gossip is persisted to SQLite with its dial history. A background dialer keeps `targetOutbound` connections open, preferring peers that have connected before, backing off exponentially from failures, banning misbehaving addresses, and shunning the node's own. A restarted node reconnects from the book without any configured seed (`src/p2p/addrbook.js`). |
 | **Node + API** | A `Node` class wiring it together, plus a REST + WebSocket server (`src/node.js`, `src/api/server.js`). The P2P layer drives the node purely through the same `submitTransaction` / `submitBlock` entry points. |
 | **Daemon + CLI** | `smartsvd` full-node daemon and `smartsv` CLI wallet/client. Env-driven config, structured logging, graceful shutdown. |
@@ -72,7 +73,9 @@ node bin/smartsvd.js --datadir ./B --reset --port 8442 --p2p-port 8443 \
   --connect 127.0.0.1:8433
 ```
 
-B performs initial block download from A, then receives every new block and
+B performs a headers-first initial block download from A — pulling A's headers,
+checking their proof of work, then fetching the bodies along that chain — and
+afterwards receives every new block and
 transaction by gossip. Add a Node C that only `--connect`s to B and it still
 discovers A through `addr` gossip. Any node can broadcast a transaction (via the
 CLI/REST) and it propagates network-wide.
@@ -213,7 +216,7 @@ deploy/
 
 ## Roadmap
 
-- Compact block / headers-first sync
+- Compact block relay (headers-first sync is done; bodies still transfer whole)
 - Pruning of deeply-buried side chains from the block tree
 - DigitalOcean Container Registry image (skip per-droplet builds)
 
