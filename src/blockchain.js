@@ -46,6 +46,12 @@ class Blockchain extends EventEmitter {
     this.undo = new Map(); // id -> undo record for active blocks
     this.orphans = new Map(); // parentId -> Block[]
     this.now = opts.now || (() => Math.floor(params.genesisTimestamp));
+
+    // Side-chain pruning policy (0 disables it entirely).
+    this.pruneDepth = opts.pruneDepth != null ? opts.pruneDepth : params.pruneDepth;
+    this.pruneInterval = opts.pruneInterval != null ? opts.pruneInterval : params.pruneInterval;
+    this.prunedCount = 0;
+    this._lastPruneHeight = 0;
   }
 
   get index() {
@@ -92,6 +98,24 @@ class Blockchain extends EventEmitter {
         main: !!row.main,
         invalid: !!row.invalid,
       });
+    }
+    // 1b. Re-add pruned side-chain blocks as body-less index entries, so the
+    //     tree shape and cumulative work survive a restart and we never
+    //     re-download a fork we already decided against.
+    for (const row of this.store.allPrunedBlocks()) {
+      this.byHash.set(row.hash, {
+        hash: row.hash,
+        height: row.height,
+        prevHash: row.prev,
+        bits: row.bits,
+        time: row.time,
+        chainwork: new BN(row.chainwork),
+        block: null,
+        main: false,
+        invalid: !!row.invalid,
+        pruned: true,
+      });
+      this.prunedCount++;
     }
     // 2. Rebuild the active chain from the `main` flag (one block per height).
     for (const node of this.byHash.values()) {
@@ -147,7 +171,12 @@ class Blockchain extends EventEmitter {
   }
   getBlock(id) {
     const n = this.byHash.get(id);
-    return n ? n.block : undefined;
+    return n && n.block ? n.block : undefined; // pruned side chains have no body
+  }
+  /** True if we know of this block but discarded its body. */
+  isPruned(id) {
+    const n = this.byHash.get(id);
+    return !!n && !!n.pruned;
   }
   getBlockByHeight(h) {
     const n = this.active[h];
@@ -236,7 +265,20 @@ class Blockchain extends EventEmitter {
 
     let result = { status: 'sidechain', id, height: node.height };
 
-    if (node.chainwork.gt(this.tip().chainwork) && !node.invalid) {
+    const blocked = node.chainwork.gt(this.tip().chainwork) ? this._prunedAncestor(node) : null;
+    if (blocked) {
+      // The winning branch runs through a fork we already pruned, i.e. this is
+      // a reorg deeper than `pruneDepth`. We keep the block but refuse to
+      // switch: honouring it would mean re-downloading bodies we discarded on
+      // purpose. Deliberate policy, not a failure.
+      result = { status: 'sidechain', id, height: node.height, prunedAncestor: blocked.hash };
+      this.emit('deep-reorg-refused', {
+        tip: this.tip().hash,
+        candidate: id,
+        height: node.height,
+        prunedAncestor: blocked.hash,
+      });
+    } else if (node.chainwork.gt(this.tip().chainwork) && !node.invalid) {
       try {
         const change = this._activateBestChain(node);
         this._persistTipChange(change); // atomic write of the whole tip change
@@ -259,10 +301,85 @@ class Blockchain extends EventEmitter {
         }
         result = { status: 'invalid', id, error: err.message, code: err.code };
       }
+      if (result.status === 'connected') this._maybePrune();
     }
 
     this._processOrphans(id);
     return result;
+  }
+
+  // --- side-chain pruning ---------------------------------------------------
+
+  /**
+   * The first pruned block on the path from `node` back to the active chain,
+   * or null if the whole path still has its bodies. Activating a branch means
+   * connecting every block on it, so one pruned ancestor makes the branch
+   * unusable no matter how much work it carries.
+   */
+  _prunedAncestor(node) {
+    let n = node;
+    while (n && !n.main) {
+      if (n.pruned) return n;
+      n = this.byHash.get(n.prevHash);
+    }
+    return n ? null : node; // path doesn't reach the active chain: treat as blocked
+  }
+
+  /** Run a sweep every `pruneInterval` blocks rather than on every tip change. */
+  _maybePrune() {
+    if (!this.pruneDepth) return;
+    if (this.height() - this._lastPruneHeight < this.pruneInterval) return;
+    this._lastPruneHeight = this.height();
+    this.pruneSideChains();
+  }
+
+  /**
+   * Discard the bodies of side-chain blocks buried more than `pruneDepth` below
+   * the active tip, keeping a body-less index entry for each.
+   *
+   * A losing fork that deep can only take over through a reorg deeper than
+   * `pruneDepth`, which this node refuses by policy — so the body is dead
+   * weight, and for a chain with 32 MB blocks it is a lot of dead weight. The
+   * index entry is what stops the fork from looking *new* again: we still
+   * recognise the hash, so it is never re-requested from a peer.
+   *
+   * Active-chain blocks are never touched — they are the chain.
+   *
+   * @returns {number} how many blocks were pruned
+   */
+  pruneSideChains() {
+    if (!this.pruneDepth) return 0;
+    const cutoff = this.height() - this.pruneDepth;
+    if (cutoff <= 0) return 0;
+
+    const victims = [];
+    for (const node of this.byHash.values()) {
+      if (node.main || node.pruned) continue;
+      if (node.height > cutoff) continue;
+      victims.push(node);
+    }
+    if (!victims.length) return 0;
+
+    this.store.transaction(() => {
+      for (const node of victims) {
+        this.store.pruneBlock({
+          hash: node.hash,
+          height: node.height,
+          prev: node.prevHash,
+          bits: node.bits,
+          time: node.time,
+          chainwork: node.chainwork.toBuffer(),
+          invalid: node.invalid ? 1 : 0,
+        });
+      }
+    });
+    for (const node of victims) {
+      node.block = null; // the point of the whole exercise
+      node.pruned = true;
+    }
+    this.prunedCount += victims.length;
+    this.emit('pruned', { count: victims.length, cutoff, height: this.height() });
+    return victims.length;
   }
 
   // --- fork activation / reorg (in-memory) --------------------------------

@@ -60,7 +60,7 @@ function main() {
 
   const log = createLogger({ level: cfg.logLevel, json: cfg.logJson, name: 'smartsvd' });
 
-  const node = new Node({ dataDir: cfg.dataDir });
+  const node = new Node({ dataDir: cfg.dataDir, pruneDepth: cfg.pruneDepth });
   if (flags.reset) node.store.reset();
   node.start();
   log.info(`${params.chainName} node started`, {
@@ -68,7 +68,19 @@ function main() {
     height: node.chain.height(),
     tip: node.chain.tip().hash,
     network: params.name,
+    pruneDepth: cfg.pruneDepth || 'disabled',
   });
+
+  node.chain.on('pruned', ({ count, cutoff }) =>
+    log.info('pruned side-chain blocks', { count, belowHeight: cutoff })
+  );
+  node.chain.on('deep-reorg-refused', (e) =>
+    log.warn('refused a reorg through a pruned fork', {
+      candidate: e.candidate,
+      height: e.height,
+      prunedAncestor: e.prunedAncestor,
+    })
+  );
 
   node.on('block', ({ height, block, reorg }) =>
     log.info('block', { height, id: block.id, txs: block.transactions.length, reorg: !!reorg })

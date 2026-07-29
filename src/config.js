@@ -62,11 +62,30 @@ function load(overrides = {}) {
     mineAddress: overrides.mineAddress || fileCfg.mineAddress || env.SMARTSV_MINE_ADDRESS || '',
     mineInterval: Number(overrides.mineInterval || fileCfg.mineInterval || env.SMARTSV_MINE_INTERVAL || 10),
 
+    // Side-chain pruning. 0 keeps every losing fork's body forever.
+    pruneDepth: numberOr(
+      [overrides.pruneDepth, fileCfg.pruneDepth, env.SMARTSV_PRUNE_DEPTH],
+      params.pruneDepth
+    ),
+
     logLevel: overrides.logLevel || fileCfg.logLevel || env.SMARTSV_LOG_LEVEL || 'info',
     logJson: envBool(env.SMARTSV_LOG_JSON, fileCfg.logJson || false),
   };
 
   return cfg;
+}
+
+/**
+ * First numeric candidate, falling back to `dflt`. Unlike `a || b` this keeps
+ * an explicit 0 — which for pruneDepth means "disabled", not "unset".
+ */
+function numberOr(candidates, dflt) {
+  for (const v of candidates) {
+    if (v == null || v === '') continue;
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return dflt;
 }
 
 /** First argument that is non-null and non-empty (handles empty arrays/strings). */

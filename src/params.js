@@ -41,6 +41,13 @@ const params = {
   medianTimeSpan: 11, // blocks used for median-time-past
   maxFutureBlockTimeSec: 2 * 60 * 60, // 2 hours
 
+  // Side-chain pruning. A losing fork this far below the active tip can only
+  // ever win via a reorg deeper than `pruneDepth`, which the node refuses by
+  // policy — so its block bodies are dropped and only the index entry is kept.
+  // Set pruneDepth to 0 to keep every body forever.
+  pruneDepth: 100, // how far below the tip a side-chain body is discarded
+  pruneInterval: 50, // blocks between sweeps (the sweep walks the whole tree)
+
   // Coinbase
   coinbaseFlag: 'SmartSV/', // human-readable tag embedded in coinbase scriptSig
 

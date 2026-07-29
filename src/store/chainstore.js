@@ -75,6 +75,21 @@ class ChainStore {
         value TEXT
       );
 
+      -- Index entries for side-chain blocks whose bodies have been pruned.
+      -- Same columns as the blocks table minus the body: enough to keep the
+      -- tree shape and cumulative work, so we still recognise the block and
+      -- never re-download it, but without paying to store it.
+      CREATE TABLE IF NOT EXISTS pruned_blocks (
+        hash      TEXT PRIMARY KEY,
+        height    INTEGER NOT NULL,
+        prev      TEXT,
+        bits      INTEGER NOT NULL,
+        time      INTEGER NOT NULL,
+        chainwork BLOB NOT NULL,
+        invalid   INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE INDEX IF NOT EXISTS idx_pruned_height ON pruned_blocks(height);
+
       CREATE TABLE IF NOT EXISTS peers (
         addr        TEXT PRIMARY KEY,
         host        TEXT NOT NULL,
@@ -102,6 +117,14 @@ class ChainStore {
       allBlocks: this.db.prepare(`SELECT * FROM blocks ORDER BY height ASC`),
       getBlock: this.db.prepare(`SELECT * FROM blocks WHERE hash=?`),
       countBlocks: this.db.prepare(`SELECT COUNT(*) c FROM blocks`),
+      delBlock: this.db.prepare(`DELETE FROM blocks WHERE hash=?`),
+
+      putPruned: this.db.prepare(
+        `INSERT OR REPLACE INTO pruned_blocks(hash,height,prev,bits,time,chainwork,invalid)
+         VALUES(@hash,@height,@prev,@bits,@time,@chainwork,@invalid)`
+      ),
+      allPruned: this.db.prepare(`SELECT * FROM pruned_blocks ORDER BY height ASC`),
+      countPruned: this.db.prepare(`SELECT COUNT(*) c FROM pruned_blocks`),
 
       addUtxo: this.db.prepare(
         `INSERT OR REPLACE INTO utxos(txid,vout,satoshis,script,height,coinbase)
@@ -176,6 +199,28 @@ class ChainStore {
     return this.q.getBlock.get(hash);
   }
 
+  // --- pruned side-chain index ---------------------------------------------
+
+  /** Replace a stored block with a body-less index entry. */
+  pruneBlock(row) {
+    this.q.putPruned.run({
+      hash: row.hash,
+      height: row.height,
+      prev: row.prev || null,
+      bits: row.bits,
+      time: row.time,
+      chainwork: row.chainwork, // Buffer
+      invalid: row.invalid ? 1 : 0,
+    });
+    this.q.delBlock.run(row.hash);
+  }
+  allPrunedBlocks() {
+    return this.q.allPruned.all();
+  }
+  countPrunedBlocks() {
+    return this.q.countPruned.get().c;
+  }
+
   // --- utxo ----------------------------------------------------------------
 
   addUtxo(txid, vout, entry) {
@@ -240,7 +285,9 @@ class ChainStore {
   }
 
   reset() {
-    this.db.exec('DELETE FROM blocks; DELETE FROM utxos; DELETE FROM undo; DELETE FROM meta;');
+    this.db.exec(
+      'DELETE FROM blocks; DELETE FROM pruned_blocks; DELETE FROM utxos; DELETE FROM undo; DELETE FROM meta;'
+    );
     this.setMeta('schema', '1');
   }
 

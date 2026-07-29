@@ -30,7 +30,11 @@ class Node extends EventEmitter {
     this.store = new ChainStore(this.dataDir);
     const clock =
       opts.now || (() => Math.floor(Date.now() / 1000));
-    this.chain = new Blockchain(this.store, { now: clock });
+    this.chain = new Blockchain(this.store, {
+      now: clock,
+      pruneDepth: opts.pruneDepth,
+      pruneInterval: opts.pruneInterval,
+    });
     this.mempool = new Mempool(this.chain);
     this._clock = clock;
 
@@ -105,6 +109,8 @@ class Node extends EventEmitter {
       utxos: this.chain.utxo.size,
       supply: this.chain.utxo.totalValue(),
       medianTime: this.chain.medianTimePast(),
+      blocksIndexed: this.chain.byHash.size,
+      prunedSideChainBlocks: this.chain.prunedCount,
     };
   }
 
