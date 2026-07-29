@@ -37,6 +37,7 @@ run end-to-end.
 | **Durable storage** | A transactional **SQLite chainstate** (`src/store/chainstore.js`) is the source of truth for the block tree, UTXO set, undo data and tip. Startup **loads** the working set — no chain replay or re-validation — and every tip change (extension or multi-block reorg) commits atomically, so a crash mid-reorg can't corrupt state. |
 | **Fork choice & reorg** | Heaviest-chainwork fork choice. When a side chain outweighs the active tip the chain **reorganises**: active blocks are disconnected (UTXO changes reversed via stored undo data) and the side chain is connected forward with full re-validation. An invalid heavier chain is **rolled back** and the valid chain restored. The mempool returns transactions orphaned by a reorg. |
 | **P2P network** | Real Bitcoin-style TCP wire protocol: `networkMagic`-framed, sha256d-checksummed messages; version/verack handshake with self-connection detection; `getblocks → inv → getdata → block` initial block download; `inv`/`getdata` gossip relay of new blocks and txs; `getaddr`/`addr` peer discovery; ping/pong keep-alive (`src/p2p/`). |
+| **Address book** | Every address learned from `version`/`addr` gossip is persisted to SQLite with its dial history. A background dialer keeps `targetOutbound` connections open, preferring peers that have connected before, backing off exponentially from failures, banning misbehaving addresses, and shunning the node's own. A restarted node reconnects from the book without any configured seed (`src/p2p/addrbook.js`). |
 | **Node + API** | A `Node` class wiring it together, plus a REST + WebSocket server (`src/node.js`, `src/api/server.js`). The P2P layer drives the node purely through the same `submitTransaction` / `submitBlock` entry points. |
 | **Daemon + CLI** | `smartsvd` full-node daemon and `smartsv` CLI wallet/client. Env-driven config, structured logging, graceful shutdown. |
 | **Production API** | Bearer **API-key auth** on mutating routes, `/health` + `/ready` probes, Prometheus `/metrics`. |
@@ -75,6 +76,11 @@ B performs initial block download from A, then receives every new block and
 transaction by gossip. Add a Node C that only `--connect`s to B and it still
 discovers A through `addr` gossip. Any node can broadcast a transaction (via the
 CLI/REST) and it propagates network-wide.
+
+`--connect` is only needed the *first* time: every peer B learns is written to
+its address book, so restarting B without any `--connect` flag still reconnects
+it to the network. `GET /peers` shows the live connections and what the book
+knows about each address.
 
 In another terminal, drive it with the CLI:
 
@@ -129,6 +135,7 @@ node.on('block', ({ height }) => console.log('new block', height));
 | `GET`  | `/address/:addr/balance` | confirmed balance |
 | `GET`  | `/address/:addr/utxos` | spendable outputs |
 | `GET`  | `/mempool` | pending txids |
+| `GET`  | `/peers` | connected peers + the persistent address book |
 | `POST` | `/tx` `{ rawtx }` | broadcast a transaction |
 | `POST` | `/block` `{ rawblock }` | submit a block (P2P-style) |
 | `POST` | `/mine` `{ address, data? }` | mine one block (dev helper) |
@@ -207,7 +214,6 @@ deploy/
 ## Roadmap
 
 - Compact block / headers-first sync
-- Persistent address book + automatic outbound peer management
 - Pruning of deeply-buried side chains from the block tree
 - DigitalOcean Container Registry image (skip per-droplet builds)
 

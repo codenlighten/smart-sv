@@ -10,6 +10,7 @@
  * Commands:
  *   newkey                         generate a key (wif/address)
  *   info                           node & chain status
+ *   peers [--all]                  connected peers (--all: the whole address book)
  *   block <idOrHeight>             show a block
  *   tx <txid>                      show a transaction
  *   balance <address>              confirmed balance (satoshis + SSV)
@@ -72,6 +73,30 @@ async function main() {
       }
       case 'info': {
         console.log(JSON.stringify(await api(url, '/info'), null, 2));
+        break;
+      }
+      case 'peers': {
+        const r = await api(url, '/peers');
+        if (!r.enabled) {
+          console.log('P2P is disabled on this node');
+          break;
+        }
+        console.log(
+          `connected: ${r.connected.length} (${r.outbound} outbound of ${r.targetOutbound} wanted), ` +
+            `known: ${r.known.length}`
+        );
+        for (const p of r.connected) {
+          console.log(`  ${p.inbound ? '<-' : '->'} ${p.addr}  height ${p.height}  ${p.userAgent || ''}`);
+        }
+        if ('all' in opt.flags) {
+          console.log('address book:');
+          for (const e of r.known) {
+            const state = e.banned ? 'banned' : e.retryIn ? `retry in ${e.retryIn}s` : 'ready';
+            console.log(
+              `  ${e.addr}  ${e.source}  ok=${e.successes} fail=${e.failures}  ${state}`
+            );
+          }
+        }
         break;
       }
       case 'block': {

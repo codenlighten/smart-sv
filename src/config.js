@@ -44,6 +44,9 @@ function load(overrides = {}) {
     p2pPort: Number(overrides.p2pPort || fileCfg.p2pPort || env.SMARTSV_P2P_PORT || params.p2pPort),
     p2pEnabled: envBool(env.SMARTSV_P2P, fileCfg.p2pEnabled !== false),
     maxPeers: Number(env.SMARTSV_MAX_PEERS || fileCfg.maxPeers || 16),
+    // Outbound connections the node keeps open, refilled from the persistent
+    // address book. Inbound slots make up the rest of maxPeers.
+    targetOutbound: Number(env.SMARTSV_TARGET_OUTBOUND || fileCfg.targetOutbound || 8),
 
     // Peers to dial on startup (comma-separated host:port). An empty override
     // array must not mask the env/file value, so treat it as "unset".

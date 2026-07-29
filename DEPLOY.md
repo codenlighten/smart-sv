@@ -96,11 +96,18 @@ export SMARTSV_API_KEY=<the api_key you set>
 
 curl $SMARTSV_URL/health          # {"status":"ok"}
 node bin/smartsv.js info          # chain height, peers, supply
+curl $SMARTSV_URL/peers           # live connections + the persistent address book
 curl $SMARTSV_URL/metrics         # Prometheus metrics (incl. smartsv_peers)
 ```
 
 Each peer droplet syncs the seed's chain over the VPC and stays current by
-gossip. Broadcast a transaction against the public API:
+gossip. `SMARTSV_CONNECT` only bootstraps the *first* start: after that each node
+remembers every peer it has met in its address book (persisted in the same SQLite
+volume as chain state) and re-dials them itself, so a restarted or reprovisioned
+droplet rejoins even if the seed is temporarily down. Watch
+`smartsv_peers_outbound` and `smartsv_addrbook_size` to confirm.
+
+Broadcast a transaction against the public API:
 
 ```bash
 node bin/smartsv.js send <wif> <toAddress> 5 --data "hello from prod"

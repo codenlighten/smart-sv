@@ -22,6 +22,7 @@ const { ValidationError } = require('../validation');
  *   GET  /address/:addr/balance     confirmed balance
  *   GET  /address/:addr/utxos       spendable UTXOs
  *   GET  /mempool                   mempool txids
+ *   GET  /peers                     connected peers + the persistent address book
  *   POST /tx        { rawtx }       broadcast a transaction   [auth]
  *   POST /block     { rawblock }    submit a block (P2P-style) [auth]
  *   POST /mine      { address }     mine one block             [auth]
@@ -154,6 +155,36 @@ async function handle(node, req, res, apiKey) {
       }
     }
 
+    if (method === 'GET' && parts[0] === 'peers') {
+      const p2p = node.p2p;
+      if (!p2p) return send(res, 200, { enabled: false, connected: [], known: [] });
+      const now = node.now();
+      return send(res, 200, {
+        enabled: true,
+        connected: [...p2p.peers]
+          .filter((p) => p.handshakeDone)
+          .map((p) => ({
+            id: p.id,
+            addr: p.addrKey || p.advertisedAddr || p.id,
+            inbound: p.inbound,
+            height: p.height,
+            userAgent: p.userAgent,
+          })),
+        outbound: p2p.outboundCount(),
+        targetOutbound: p2p.targetOutbound,
+        known: p2p.addrBook.list().map((e) => ({
+          addr: e.addr,
+          source: e.source,
+          lastSeen: e.lastSeen,
+          lastSuccess: e.lastSuccess,
+          failures: e.failures,
+          successes: e.successes,
+          banned: e.bannedUntil > now,
+          retryIn: p2p.addrBook.backoffRemaining(e, now),
+        })),
+      });
+    }
+
     if (method === 'GET' && parts[0] === 'mempool') {
       return send(res, 200, {
         size: node.mempool.size(),
@@ -233,6 +264,12 @@ function sendMetrics(res, node) {
     '# HELP smartsv_peers Connected P2P peers',
     '# TYPE smartsv_peers gauge',
     `smartsv_peers ${node.peerCount ? node.peerCount() : 0}`,
+    '# HELP smartsv_peers_outbound Outbound P2P connections',
+    '# TYPE smartsv_peers_outbound gauge',
+    `smartsv_peers_outbound ${node.p2p ? node.p2p.outboundCount() : 0}`,
+    '# HELP smartsv_addrbook_size Addresses in the persistent address book',
+    '# TYPE smartsv_addrbook_size gauge',
+    `smartsv_addrbook_size ${node.p2p ? node.p2p.addrBook.size() : 0}`,
     '# HELP smartsv_uptime_seconds Process uptime',
     '# TYPE smartsv_uptime_seconds counter',
     `smartsv_uptime_seconds ${Math.floor(process.uptime())}`,

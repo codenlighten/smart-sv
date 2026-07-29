@@ -80,12 +80,18 @@ function main() {
     p2p = new PeerManager(node, {
       port: cfg.p2pPort,
       maxPeers: cfg.maxPeers,
+      targetOutbound: cfg.targetOutbound,
       log: (m) => log.debug(m),
     });
     p2p.start();
     node.peerCount = () => p2p.peerCount();
-    for (const target of cfg.connect) p2p.connect(target);
-    if (cfg.connect.length) log.info('dialing peers', { peers: cfg.connect });
+    node.p2p = p2p; // exposes the address book to the RPC layer
+    for (const target of cfg.connect) p2p.connect(target, { source: 'seed' });
+    if (cfg.connect.length) log.info('dialing seed peers', { peers: cfg.connect });
+    log.info('address book loaded', {
+      known: p2p.addrBook.size(),
+      targetOutbound: cfg.targetOutbound,
+    });
   }
 
   // --- RPC / WS ---

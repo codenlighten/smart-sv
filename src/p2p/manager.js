@@ -5,10 +5,14 @@ const EventEmitter = require('events');
 const sv = require('../sv');
 const params = require('../params');
 const { Peer } = require('./peer');
+const { AddrBook } = require('./addrbook');
 
 const PROTOCOL_VERSION = 1;
 const MAX_INV_PER_BATCH = 500; // block hashes announced per getblocks response
 const PING_INTERVAL_MS = 30000;
+const DIAL_INTERVAL_MS = 15000; // how often to top up outbound connections
+const FIRST_DIAL_DELAY_MS = 500; // reconnect to known peers promptly after start
+const MAX_ADDRS_PER_MSG = 1000;
 
 /**
  * PeerManager: the SmartSV P2P network layer.
@@ -19,7 +23,8 @@ const PING_INTERVAL_MS = 30000;
  *   - initial block download: getblocks → inv → getdata → block, applied in order
  *   - inv/getdata gossip relay of new blocks and transactions, wired to the
  *     node's `block`/`tx` events
- *   - a small address book with getaddr/addr exchange
+ *   - a persistent address book (see addrbook.js) fed by getaddr/addr exchange,
+ *     and automatic outbound peer management on top of it
  *
  * It drives the node purely through `submitBlock` / `submitTransaction`, so it
  * is fully decoupled from consensus.
@@ -30,17 +35,33 @@ class PeerManager extends EventEmitter {
     this.node = node;
     this.port = opts.port != null ? opts.port : params.p2pPort; // 0 => OS-assigned
     this.maxPeers = opts.maxPeers || 16;
+    this.targetOutbound = Math.min(
+      opts.targetOutbound != null ? opts.targetOutbound : 8,
+      this.maxPeers
+    );
     this.peers = new Set();
-    this.addrBook = new Map(); // "host:port" -> lastSeen (epoch sec)
+    this.dialing = new Set(); // addrKeys with a dial in flight
     this.server = null;
     this.nonce = sv.crypto.Random.getRandomBuffer(8).toString('hex');
     this._pingTimer = null;
+    this._dialTimer = null;
+    this._dialIntervalMs = opts.dialInterval || DIAL_INTERVAL_MS;
+    this._running = false;
     this._log = opts.log || (() => {});
+
+    // Peers are persisted alongside chain state unless persistence is opted out
+    // of (opts.store === null), which keeps the book purely in-memory.
+    const store = opts.store !== undefined ? opts.store : node.store;
+    this.addrBook = new AddrBook(store, {
+      now: () => this.node.now(),
+      log: this._log,
+    });
   }
 
   // --- lifecycle ----------------------------------------------------------
 
   start() {
+    this._running = true;
     this.server = net.createServer((socket) => this._addPeer(socket, true));
     this.server.on('error', (e) => this._log(`[p2p] server error: ${e.message}`));
     this.server.listen(this.port, () => {
@@ -55,28 +76,95 @@ class PeerManager extends EventEmitter {
 
     this._pingTimer = setInterval(() => this._pingAll(), PING_INTERVAL_MS);
     if (this._pingTimer.unref) this._pingTimer.unref();
+
+    // Keep outbound connections topped up from the address book. The first pass
+    // runs almost immediately so a restarted node reconnects to peers it already
+    // knows without waiting a full interval.
+    this._firstDial = setTimeout(() => this._maintainOutbound(), FIRST_DIAL_DELAY_MS);
+    if (this._firstDial.unref) this._firstDial.unref();
+    this._dialTimer = setInterval(() => this._maintainOutbound(), this._dialIntervalMs);
+    if (this._dialTimer.unref) this._dialTimer.unref();
     return this;
   }
 
   stop() {
+    this._running = false;
     if (this._pingTimer) clearInterval(this._pingTimer);
+    if (this._dialTimer) clearInterval(this._dialTimer);
+    if (this._firstDial) clearTimeout(this._firstDial);
     for (const peer of this.peers) peer.destroy();
     this.peers.clear();
+    this.dialing.clear();
     if (this.server) this.server.close();
   }
 
-  /** Dial a peer at "host:port" (or {host, port}). */
-  connect(target) {
+  /**
+   * Dial a peer at "host:port" (or {host, port}).
+   * @param {object} [opts]
+   * @param {string} [opts.source] how we learned the address ('seed'|'book'|'gossip')
+   * @returns {boolean} whether a dial was actually started
+   */
+  connect(target, opts = {}) {
     const { host, port } = normalizeAddr(target);
+    const addrKey = `${host}:${port}`;
+    if (!this.addrBook.add(addrKey, { source: opts.source || 'seed' })) {
+      this._log(`[p2p] refusing to dial unusable address ${addrKey}`);
+      return false;
+    }
+    if (this.dialing.has(addrKey) || this._connectedAddrs().has(addrKey)) return false;
+    if (this.peers.size >= this.maxPeers) return false;
+
+    this.dialing.add(addrKey);
+    this.addrBook.markAttempt(addrKey);
     const socket = net.connect({ host, port }, () => {
-      this._log(`[p2p] connected out to ${host}:${port}`);
+      this._log(`[p2p] connected out to ${addrKey}`);
     });
-    socket.on('error', (e) => this._log(`[p2p] dial ${host}:${port} failed: ${e.message}`));
-    this._addPeer(socket, false, `${host}:${port}`);
+    socket.on('error', (e) => this._log(`[p2p] dial ${addrKey} failed: ${e.message}`));
+    this._addPeer(socket, false, addrKey);
+    return true;
   }
 
   peerCount() {
     return this.peers.size;
+  }
+
+  outboundCount() {
+    let n = 0;
+    for (const peer of this.peers) if (!peer.inbound) n++;
+    return n;
+  }
+
+  // --- outbound peer management -------------------------------------------
+
+  /**
+   * Top up outbound connections towards `targetOutbound`, picking the most
+   * promising addresses that are not already connected, in flight, or backing
+   * off after a failure.
+   */
+  _maintainOutbound() {
+    if (!this._running) return;
+    // Every in-flight dial already has a Peer object, so outboundCount() covers
+    // both connected and connecting outbound slots.
+    const need = Math.min(
+      this.targetOutbound - this.outboundCount(),
+      this.maxPeers - this.peers.size
+    );
+    if (need <= 0) return;
+
+    const candidates = this.addrBook.select(need, { exclude: this._connectedAddrs() });
+    if (!candidates.length) return;
+    this._log(`[p2p] dialing ${candidates.length} peer(s) from the address book`);
+    for (const addr of candidates) this.connect(addr, { source: 'book' });
+  }
+
+  /** Addresses we are already connected to or dialling — never dial these again. */
+  _connectedAddrs() {
+    const busy = new Set(this.dialing);
+    for (const peer of this.peers) {
+      if (peer.addrKey) busy.add(peer.addrKey);
+      if (peer.advertisedAddr) busy.add(peer.advertisedAddr);
+    }
+    return busy;
   }
 
   // --- peer wiring --------------------------------------------------------
@@ -84,6 +172,7 @@ class PeerManager extends EventEmitter {
   _addPeer(socket, inbound, addrKey) {
     if (this.peers.size >= this.maxPeers) {
       socket.destroy();
+      if (addrKey) this.dialing.delete(addrKey);
       return;
     }
     const peer = new Peer(socket, { inbound });
@@ -95,6 +184,12 @@ class PeerManager extends EventEmitter {
     peer.on('message', (msg) => this._onMessage(peer, msg));
     peer.on('close', () => {
       this.peers.delete(peer);
+      if (addrKey) {
+        this.dialing.delete(addrKey);
+        // A dial that never reached verack counts against the address, so its
+        // backoff grows and better candidates get tried first.
+        if (!peer.handshakeDone && !peer.selfConnection) this.addrBook.markFailure(addrKey);
+      }
       this._log(`[p2p] peer ${peer.id} closed (${this.peers.size} left)`);
     });
     peer.on('error', () => peer.destroy());
@@ -147,6 +242,9 @@ class PeerManager extends EventEmitter {
   _onVersion(peer, payload) {
     if (payload.nonce && payload.nonce === this.nonce) {
       this._log('[p2p] self-connection detected, dropping');
+      peer.selfConnection = true;
+      // Remember that this address is us, so the dialer stops picking it.
+      if (peer.addrKey) this.addrBook.markSelf(peer.addrKey);
       peer.destroy();
       return;
     }
@@ -155,7 +253,9 @@ class PeerManager extends EventEmitter {
     peer.userAgent = payload.userAgent;
     peer.remoteNonce = payload.nonce;
     if (payload.port && peer.socket.remoteAddress) {
-      this._noteAddr(`${cleanHost(peer.socket.remoteAddress)}:${payload.port}`);
+      // The peer's *listening* address (their source port is ephemeral).
+      peer.advertisedAddr = `${cleanHost(peer.socket.remoteAddress)}:${payload.port}`;
+      this._noteAddr(peer.advertisedAddr);
     }
     peer.send('verack', {});
   }
@@ -163,6 +263,10 @@ class PeerManager extends EventEmitter {
   _onVerack(peer) {
     if (peer.handshakeDone) return;
     peer.handshakeDone = true;
+    if (peer.addrKey) {
+      this.dialing.delete(peer.addrKey);
+      this.addrBook.markSuccess(peer.addrKey);
+    }
     this._log(`[p2p] handshake done with ${peer.id} (their height ${peer.height})`);
     this.emit('peer', peer);
 
@@ -174,17 +278,24 @@ class PeerManager extends EventEmitter {
   // --- address book --------------------------------------------------------
 
   _onGetAddr(peer) {
-    const addrs = [...this.addrBook.keys()].slice(0, 1000);
+    // Don't advertise addresses we know to be bad (banned, or ourselves).
+    const now = this.node.now();
+    const addrs = this.addrBook
+      .list()
+      .filter((e) => e.bannedUntil <= now && e.source !== 'self')
+      .slice(0, MAX_ADDRS_PER_MSG)
+      .map((e) => e.addr);
     peer.send('addr', { addrs });
   }
 
   _onAddr(peer, payload) {
-    for (const a of payload.addrs || []) this._noteAddr(a);
+    const addrs = (payload.addrs || []).slice(0, MAX_ADDRS_PER_MSG);
+    const added = this.addrBook.addMany(addrs, { source: 'gossip' });
+    if (added) this._log(`[p2p] learned ${added} address(es) from ${peer.id}`);
   }
 
   _noteAddr(addrKey) {
-    if (!addrKey || addrKey.startsWith('undefined')) return;
-    this.addrBook.set(addrKey, this.node.now());
+    this.addrBook.add(addrKey, { source: 'gossip' });
   }
 
   // --- inventory / relay ---------------------------------------------------
@@ -289,7 +400,7 @@ class PeerManager extends EventEmitter {
     try {
       block = sv.Block.fromBuffer(payload);
     } catch (e) {
-      this._log(`[p2p] undecodable block from ${peer.id}: ${e.message}`);
+      this._penalize(peer, `undecodable block: ${e.message}`);
       return;
     }
     peer.markKnown(block.id);
@@ -318,7 +429,7 @@ class PeerManager extends EventEmitter {
         this._log(`[p2p] stored side-chain block ${block.id.slice(0, 12)} from ${peer.id}`);
         break;
       case 'invalid':
-        this._log(`[p2p] invalid block ${block.id.slice(0, 12)} from ${peer.id}: ${res.error}`);
+        this._penalize(peer, `invalid block ${block.id.slice(0, 12)}: ${res.error}`);
         break;
       default:
         break; // duplicate
@@ -341,6 +452,14 @@ class PeerManager extends EventEmitter {
   }
 
   // --- helpers -------------------------------------------------------------
+
+  /** Drop a misbehaving peer and ban its address so the dialer skips it. */
+  _penalize(peer, reason) {
+    const addr = peer.addrKey || peer.advertisedAddr;
+    this._log(`[p2p] dropping ${peer.id}: ${reason}${addr ? ' (address banned)' : ''}`);
+    if (addr) this.addrBook.ban(addr);
+    peer.destroy();
+  }
 
   _haveTx(txid) {
     return this.node.mempool.has(txid) || !!this._confirmedTx(txid);

@@ -19,6 +19,10 @@ const Database = require('better-sqlite3');
  *   utxos(txid, vout, satoshis, script, height, coinbase, PK(txid,vout)) INDEX(script)
  *   undo(hash PK, data BLOB)      -- JSON undo record for a connected block
  *   meta(key PK, value)           -- e.g. tip hash, schema version
+ *   peers(addr PK, host, port, ...) -- the P2P address book (see p2p/addrbook.js)
+ *
+ * `peers` is deliberately NOT chain state: it survives `reset()` so a wiped node
+ * still knows who to reconnect to.
  */
 class ChainStore {
   constructor(dataDir) {
@@ -70,6 +74,20 @@ class ChainStore {
         key   TEXT PRIMARY KEY,
         value TEXT
       );
+
+      CREATE TABLE IF NOT EXISTS peers (
+        addr        TEXT PRIMARY KEY,
+        host        TEXT NOT NULL,
+        port        INTEGER NOT NULL,
+        firstSeen   INTEGER NOT NULL DEFAULT 0,
+        lastSeen    INTEGER NOT NULL DEFAULT 0,
+        lastTry     INTEGER NOT NULL DEFAULT 0,
+        lastSuccess INTEGER NOT NULL DEFAULT 0,
+        failures    INTEGER NOT NULL DEFAULT 0,
+        successes   INTEGER NOT NULL DEFAULT 0,
+        bannedUntil INTEGER NOT NULL DEFAULT 0,
+        source      TEXT
+      );
     `);
   }
 
@@ -98,6 +116,15 @@ class ChainStore {
 
       getMeta: this.db.prepare(`SELECT value FROM meta WHERE key=?`),
       setMeta: this.db.prepare(`INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)`),
+
+      putPeer: this.db.prepare(
+        `INSERT OR REPLACE INTO peers
+           (addr,host,port,firstSeen,lastSeen,lastTry,lastSuccess,failures,successes,bannedUntil,source)
+         VALUES
+           (@addr,@host,@port,@firstSeen,@lastSeen,@lastTry,@lastSuccess,@failures,@successes,@bannedUntil,@source)`
+      ),
+      delPeer: this.db.prepare(`DELETE FROM peers WHERE addr=?`),
+      allPeers: this.db.prepare(`SELECT * FROM peers`),
     };
   }
 
@@ -181,6 +208,30 @@ class ChainStore {
     this.q.delUndo.run(hash);
   }
 
+  // --- peers (address book) -------------------------------------------------
+
+  putPeer(entry) {
+    this.q.putPeer.run({
+      addr: entry.addr,
+      host: entry.host,
+      port: entry.port,
+      firstSeen: int(entry.firstSeen),
+      lastSeen: int(entry.lastSeen),
+      lastTry: int(entry.lastTry),
+      lastSuccess: int(entry.lastSuccess),
+      failures: int(entry.failures),
+      successes: int(entry.successes),
+      bannedUntil: int(entry.bannedUntil),
+      source: entry.source || null,
+    });
+  }
+  delPeer(addr) {
+    this.q.delPeer.run(addr);
+  }
+  allPeers() {
+    return this.q.allPeers.all();
+  }
+
   // --- transactions --------------------------------------------------------
 
   /** Run `fn` inside a single atomic SQLite transaction. */
@@ -196,6 +247,11 @@ class ChainStore {
   close() {
     this.db.close();
   }
+}
+
+/** Coerce to a safe integer for SQLite INTEGER columns (better-sqlite3 rejects floats/NaN). */
+function int(v) {
+  return Number.isFinite(v) ? Math.trunc(v) : 0;
 }
 
 module.exports = { ChainStore };
