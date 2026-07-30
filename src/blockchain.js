@@ -51,6 +51,7 @@ class Blockchain extends EventEmitter {
     this.pruneDepth = opts.pruneDepth != null ? opts.pruneDepth : params.pruneDepth;
     this.pruneInterval = opts.pruneInterval != null ? opts.pruneInterval : params.pruneInterval;
     this.prunedCount = 0;
+    this.prunedUndoCount = 0;
     this._lastPruneHeight = 0;
   }
 
@@ -265,18 +266,26 @@ class Blockchain extends EventEmitter {
 
     let result = { status: 'sidechain', id, height: node.height };
 
-    const blocked = node.chainwork.gt(this.tip().chainwork) ? this._prunedAncestor(node) : null;
+    const blocked =
+      node.chainwork.gt(this.tip().chainwork) && !node.invalid ? this._reorgBlocked(node) : null;
     if (blocked) {
-      // The winning branch runs through a fork we already pruned, i.e. this is
-      // a reorg deeper than `pruneDepth`. We keep the block but refuse to
-      // switch: honouring it would mean re-downloading bodies we discarded on
-      // purpose. Deliberate policy, not a failure.
-      result = { status: 'sidechain', id, height: node.height, prunedAncestor: blocked.hash };
+      // This branch out-works our tip but we pruned state the switch would
+      // need, which means it is a reorg deeper than `pruneDepth`. Keep the
+      // block, refuse the switch: deliberate policy, not a failure.
+      result = {
+        status: 'sidechain',
+        id,
+        height: node.height,
+        refused: blocked.reason,
+        prunedAncestor: blocked.at,
+      };
       this.emit('deep-reorg-refused', {
         tip: this.tip().hash,
         candidate: id,
         height: node.height,
-        prunedAncestor: blocked.hash,
+        reason: blocked.reason,
+        at: blocked.at,
+        atHeight: blocked.height,
       });
     } else if (node.chainwork.gt(this.tip().chainwork) && !node.invalid) {
       try {
@@ -311,18 +320,31 @@ class Blockchain extends EventEmitter {
   // --- side-chain pruning ---------------------------------------------------
 
   /**
-   * The first pruned block on the path from `node` back to the active chain,
-   * or null if the whole path still has its bodies. Activating a branch means
-   * connecting every block on it, so one pruned ancestor makes the branch
-   * unusable no matter how much work it carries.
+   * Why a candidate branch cannot be activated, or null if it can.
+   *
+   * Switching chains needs two things, and pruning can take either away:
+   *   - every block on the branch, to connect it — a pruned body kills it
+   *   - an undo record for every active block above the fork, to disconnect it
+   * Both failures mean the same thing: a reorg deeper than `pruneDepth`, which
+   * this node declines. Checking before we touch any state is what keeps the
+   * refusal clean rather than a half-applied chain.
    */
-  _prunedAncestor(node) {
+  _reorgBlocked(node) {
     let n = node;
     while (n && !n.main) {
-      if (n.pruned) return n;
+      if (n.pruned) return { reason: 'pruned-fork', at: n.hash, height: n.height };
       n = this.byHash.get(n.prevHash);
     }
-    return n ? null : node; // path doesn't reach the active chain: treat as blocked
+    if (!n) return { reason: 'detached-branch', at: node.hash, height: node.height };
+
+    // `n` is the fork point on the active chain; everything above it has to come off.
+    for (let h = this.height(); h > n.height; h--) {
+      const active = this.active[h];
+      if (!this.undo.has(active.hash)) {
+        return { reason: 'pruned-undo', at: active.hash, height: h };
+      }
+    }
+    return null;
   }
 
   /** Run a sweep every `pruneInterval` blocks rather than on every tip change. */
@@ -331,6 +353,44 @@ class Blockchain extends EventEmitter {
     if (this.height() - this._lastPruneHeight < this.pruneInterval) return;
     this._lastPruneHeight = this.height();
     this.pruneSideChains();
+    this.pruneUndoRecords();
+  }
+
+  /**
+   * Discard undo records for active-chain blocks buried more than `pruneDepth`
+   * below the tip.
+   *
+   * An undo record exists for exactly one purpose: to roll a block back during
+   * a reorg. Its size scales with the block's transaction count, so on a busy
+   * chain this is the fastest-growing state a node holds — and every record
+   * below the reorg limit is one we have already decided never to use.
+   *
+   * The walk starts at the cutoff and stops at the first record already gone,
+   * so a sweep costs only the blocks newly buried since the last one rather
+   * than a pass over the whole chain.
+   *
+   * @returns {number} how many records were discarded
+   */
+  pruneUndoRecords() {
+    if (!this.pruneDepth) return 0;
+    const cutoff = this.height() - this.pruneDepth;
+    if (cutoff < 1) return 0;
+
+    const victims = [];
+    for (let h = cutoff; h >= 1; h--) {
+      const node = this.active[h];
+      if (!node || !this.undo.has(node.hash)) break; // everything below is done already
+      victims.push(node.hash);
+    }
+    if (!victims.length) return 0;
+
+    this.store.transaction(() => {
+      for (const hash of victims) this.store.delUndo(hash);
+    });
+    for (const hash of victims) this.undo.delete(hash);
+    this.prunedUndoCount += victims.length;
+    this.emit('pruned-undo', { count: victims.length, cutoff, height: this.height() });
+    return victims.length;
   }
 
   /**

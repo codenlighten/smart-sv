@@ -74,11 +74,16 @@ function main() {
   node.chain.on('pruned', ({ count, cutoff }) =>
     log.info('pruned side-chain blocks', { count, belowHeight: cutoff })
   );
+  node.chain.on('pruned-undo', ({ count, cutoff }) =>
+    log.info('pruned undo records', { count, belowHeight: cutoff })
+  );
   node.chain.on('deep-reorg-refused', (e) =>
-    log.warn('refused a reorg through a pruned fork', {
+    log.warn('refused a reorg deeper than the prune depth', {
       candidate: e.candidate,
       height: e.height,
-      prunedAncestor: e.prunedAncestor,
+      reason: e.reason,
+      at: e.at,
+      atHeight: e.atHeight,
     })
   );
 

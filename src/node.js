@@ -111,6 +111,8 @@ class Node extends EventEmitter {
       medianTime: this.chain.medianTimePast(),
       blocksIndexed: this.chain.byHash.size,
       prunedSideChainBlocks: this.chain.prunedCount,
+      undoRecords: this.chain.undo.size,
+      prunedUndoRecords: this.chain.prunedUndoCount,
     };
   }
 

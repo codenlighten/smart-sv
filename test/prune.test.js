@@ -8,12 +8,17 @@
  * only take over via a reorg deeper than the node is willing to perform, so the
  * body is dead weight — at 32 MB a block, expensive dead weight.
  *
- * These checks cover the whole bargain, including the part we give up:
+ * The same bargain applies to undo records — the rollback data for main-chain
+ * blocks, which exists only to reverse a block during a reorg.
+ *
+ * These checks cover the whole deal, including the part we give up:
  *   1. bodies of deeply-buried side chains are dropped, from memory AND SQLite
  *   2. the active chain, recent forks, and the UTXO set are untouched
  *   3. the index entry survives, so the fork is still recognised (never
  *      re-downloaded) and pruning survives a restart
- *   4. the cost: a reorg onto a pruned fork is refused rather than mis-applied
+ *   4. undo records below the reorg limit are discarded, while recent ones are
+ *      kept and shallow reorgs keep working normally
+ *   5. the cost: a reorg needing pruned state is refused, not mis-applied
  */
 
 const os = require('os');
@@ -110,6 +115,26 @@ function main() {
   ok(A.node.store.getBlockRow(rivalA.id) === undefined, 'their bodies are deleted from blocks');
   ok(!!A.node.store.getBlockRow(A.node.chain.tip().hash), 'the active tip body is still stored');
 
+  console.log('undo records below the reorg limit are discarded');
+  A.node.chain.pruneUndoRecords();
+  const keptUndo = A.node.chain.undo.size;
+  ok(A.node.chain.prunedUndoCount === 7, 'undo records for heights 1..7 were discarded');
+  ok(keptUndo === 10, 'exactly pruneDepth (10) recent records are retained');
+  for (let h = 8; h <= 17; h++) {
+    assert.ok(
+      A.node.chain.undo.has(A.node.chain.active[h].hash),
+      `undo for height ${h} is retained`
+    );
+  }
+  ok(true, 'every block within pruneDepth kept its undo record');
+  ok(!A.node.chain.undo.has(A.node.chain.active[1].hash), 'the deepest record is gone');
+  ok(A.node.store.getUndo(A.node.chain.active[1].hash) === null, 'and gone from SQLite too');
+  ok(!!A.node.store.getUndo(A.node.chain.active[17].hash), 'the tip record is still stored');
+
+  console.log('a second sweep does no redundant work');
+  ok(A.node.chain.pruneUndoRecords() === 0, 're-running the sweep discards nothing further');
+  ok(A.node.chain.undo.size === keptUndo, 'the retained set is unchanged');
+
   console.log('pruning survives a restart');
   const tipBefore = A.node.chain.tip().hash;
   const supplyBefore = A.node.info().supply;
@@ -143,6 +168,50 @@ function main() {
   ok(A2.node.chain.height() === 17, 'the node stayed on its own chain');
   ok(A2.node.getBalance(rival) === 0, 'no rival coinbase was credited');
 
+  console.log('a shallow reorg still works with undo pruned');
+  // Its own node: a successful reorg changes the chain, and the checks above
+  // depend on A2 staying put.
+  const R = mk('R');
+  for (let i = 0; i < 20; i++) R.node.mine(miner);
+  R.node.chain.pruneUndoRecords();
+  ok(R.node.chain.prunedUndoCount === 10, 'R discarded its 10 deepest undo records');
+  const rivalParent = R.node.chain.active[19]; // one below the tip — well inside pruneDepth
+  const s1 = mineOnto(R.node, rivalParent, rival);
+  R.node.submitBlock(s1);
+  const s2 = mineOnto(R.node, R.node.chain.byHash.get(s1.id), rival);
+  const shallow = R.node.submitBlock(s2);
+  ok(shallow.status === 'connected', 'a reorg inside pruneDepth is applied, not refused');
+  ok(shallow.reorg === true, 'and it is reported as a reorg');
+  ok(R.node.chain.height() === 21, 'R moved onto the heavier recent fork');
+  ok(R.node.chain.tip().hash === s2.id, 'the new tip is the rival block');
+  ok(R.node.getBalance(rival) === 2 * params.initialSubsidy, 'the rival miner is credited');
+
+  console.log('a reorg blocked only by missing undo records');
+  // Only undo is pruned here (never pruneSideChains), so the rival branch has
+  // every body it needs — the sole obstacle is our own missing rollback data.
+  const U = mk('U');
+  for (let i = 0; i < 30; i++) U.node.mine(miner);
+  U.node.chain.pruneUndoRecords();
+  ok(U.node.chain.undo.size === 10, 'U retains undo for heights 21..30 only');
+
+  let undoRefusal = null;
+  U.node.chain.on('deep-reorg-refused', (e) => (undoRefusal = e));
+  let p = U.node.chain.active[15]; // forking here needs undo for 16..30
+  let deep = null;
+  for (let i = 0; i < 17; i++) {
+    const block = mineOnto(U.node, p, rival);
+    deep = U.node.submitBlock(block);
+    p = U.node.chain.byHash.get(block.id);
+  }
+  ok(p.height === 32 && p.chainwork.gt(U.node.chain.tip().chainwork), 'the rival branch out-works us');
+  ok(!U.node.chain.isPruned(p.hash), 'the rival branch still has all of its bodies');
+  ok(deep.status === 'sidechain', 'the heavier branch is refused');
+  ok(deep.refused === 'pruned-undo', 'and the reason is the missing undo records, not a pruned fork');
+  ok(undoRefusal && undoRefusal.reason === 'pruned-undo', 'the event carries the same reason');
+  ok(undoRefusal.atHeight === 20, 'it names the deepest block it could no longer disconnect');
+  ok(U.node.chain.height() === 30, 'the tip did not move');
+  ok(U.node.getBalance(rival) === 0, 'no rival coinbase was credited');
+
   console.log('pruning can be turned off');
   const B = mk('B', { pruneDepth: 0 });
   for (let i = 0; i < 5; i++) B.node.mine(miner);
@@ -150,13 +219,14 @@ function main() {
   B.node.submitBlock(bFork);
   for (let i = 0; i < 20; i++) B.node.mine(miner);
   B.node.chain.pruneSideChains();
+  B.node.chain.pruneUndoRecords();
   ok(B.node.chain.prunedCount === 0, 'pruneDepth 0 keeps every body');
   ok(!!B.node.chain.getBlock(bFork.id), 'the old fork body is still there');
+  ok(B.node.chain.prunedUndoCount === 0, 'pruneDepth 0 keeps every undo record');
+  ok(B.node.chain.undo.size === 25, 'all 25 undo records are retained');
 
-  A2.node.close();
-  B.node.close();
-  fs.rmSync(A.dir, { recursive: true, force: true });
-  fs.rmSync(B.dir, { recursive: true, force: true });
+  for (const n of [A2, B, R, U]) n.node.close();
+  for (const d of [A.dir, B.dir, R.dir, U.dir]) fs.rmSync(d, { recursive: true, force: true });
   console.log(`\nAll ${passed} pruning checks passed ✅`);
   process.exit(0);
 }
