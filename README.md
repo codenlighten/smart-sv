@@ -8,7 +8,7 @@ A **standalone UTXO blockchain** — its own genesis, network, and consensus,
 built for big blocks, unrestricted Bitcoin Script, and cheap on-chain data.
 
 SmartSV pairs a from-scratch node (proof-of-work, UTXO set, mempool, P2P,
-fork/reorg handling, durable storage) with a battle-tested **primitives library**
+fork/reorg handling, durable storage) with a **primitives library**
 for the cryptography and transaction/script/block formats. That means anything
 you can build with standard Bitcoin primitives — HD wallets, multisig, covenants,
 OP_RETURN data, DIDs, verifiable credentials — works on SmartSV, on a chain you
